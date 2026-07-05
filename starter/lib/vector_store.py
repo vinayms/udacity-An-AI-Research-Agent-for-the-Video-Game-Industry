@@ -2,21 +2,32 @@
 
 import os
 import chromadb
-from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
+from chromadb.utils import embedding_functions
 from lib.llm import LLMClient
 
-class OpenAIEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, llm_client):
-        self.llm_client = llm_client
-
-    def __call__(self, input: Documents) -> Embeddings:
-        return [self.llm_client.get_embedding(doc) for doc in input]
-
 class GameVectorStore:
-    def __init__(self, db_path="starter/games_chromadb", collection_name="games_collection"):
+    def __init__(self, db_path=None, collection_name="udaplay"):
         self.llm_client = LLMClient()
-        self.embedding_function = OpenAIEmbeddingFunction(self.llm_client)
         
+        openai_key = os.getenv("OPENAI_API_KEY")
+        self.embedding_function = embedding_functions.OpenAIEmbeddingFunction(
+            api_key=openai_key,
+            model_name="text-embedding-3-small",
+            api_base="https://openai.vocareum.com/v1/"
+        )
+        
+        # Robust relative path detection based on execution directory
+        if db_path is None:
+            if os.path.exists("games_chromadb"):
+                db_path = "games_chromadb"
+            elif os.path.exists("starter/games_chromadb"):
+                db_path = "starter/games_chromadb"
+            else:
+                if os.path.basename(os.getcwd()) == "starter":
+                    db_path = "games_chromadb"
+                else:
+                    db_path = "starter/games_chromadb"
+                    
         # Ensure persistent database directory
         os.makedirs(db_path, exist_ok=True)
         self.client = chromadb.PersistentClient(path=db_path)

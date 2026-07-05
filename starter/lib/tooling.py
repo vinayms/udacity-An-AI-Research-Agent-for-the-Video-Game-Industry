@@ -1,9 +1,25 @@
-# starter/lib/tooling.py
-
 import os
-from tavily import TavilyClient
+from pydantic import BaseModel, Field
 from lib.vector_store import GameVectorStore
 from lib.llm import LLMClient
+from tavily import TavilyClient
+
+class EvaluationReport(BaseModel):
+    useful: bool = Field(description="True if the retrieved documents are sufficient to answer the query, False otherwise")
+    description: str = Field(description="Brief explanation of why the context is useful or not")
+
+    def __getitem__(self, item):
+        if item == "status":
+            return "SUFFICIENT" if self.useful else "INSUFFICIENT"
+        if item == "explanation":
+            return self.description
+        return getattr(self, item)
+
+    def get(self, item, default=None):
+        try:
+            return self[item]
+        except AttributeError:
+            return default
 
 class GameResearchTools:
     def __init__(self):
@@ -39,24 +55,20 @@ class GameResearchTools:
             })
         return {"query": query, "results": formatted_results}
 
-    def evaluate_retrieval(self, query: str, retrieved_context: str) -> dict:
+    def evaluate_retrieval(self, query: str, retrieved_context: str) -> EvaluationReport:
         """
         Tool 2: Uses the LLM to assess whether the retrieved context contains sufficient, 
         accurate, and confident information to fully answer the user query.
-        Returns a JSON object with 'status' ("SUFFICIENT" or "INSUFFICIENT") and 'explanation'.
+        Returns an EvaluationReport Pydantic object.
         """
         system_message = (
             "You are an expert gaming research evaluator. Your task is to analyze whether the "
             "provided search results (Retrieved Context) contain sufficient, precise, and confident details "
             "to answer the User Query.\n"
             "If the context contains the specific game, platform, publisher, release year, or active developer details "
-            "needed to answer the query, reply with SUFFICIENT. "
-            "If the context is missing key facts, has low confidence, or does not address the specific query, reply with INSUFFICIENT.\n\n"
-            "Respond in this exact JSON format:\n"
-            "{\n"
-            "  \"status\": \"SUFFICIENT\" or \"INSUFFICIENT\",\n"
-            "  \"explanation\": \"brief explanation of why the context is sufficient or insufficient\"\n"
-            "}"
+            "needed to answer the query, set useful to true. "
+            "If the context is missing key facts, has low confidence, or does not address the specific query, set useful to false.\n\n"
+            "Provide a detailed description explaining your decision."
         )
         
         user_message = (
@@ -70,94 +82,41 @@ class GameResearchTools:
         ]
         
         try:
-            import json
-            raw_response = self.llm_client.get_completion(messages, temperature=0.0)
-            # Safe JSON parse
-            cleaned_response = raw_response
-            if cleaned_response.startswith("```"):
-                lines = cleaned_response.splitlines()
-                if len(lines) > 2:
-                    cleaned_response = "\n".join(lines[1:-1])
-            parsed = json.loads(cleaned_response)
-            return {
-                "status": parsed.get("status", "INSUFFICIENT").upper(),
-                "explanation": parsed.get("explanation", "Could not parse evaluation.")
-            }
+            response = self.llm_client.client.beta.chat.completions.parse(
+                model="gpt-4o-mini",
+                messages=messages,
+                response_format=EvaluationReport,
+                temperature=0.0
+            )
+            return response.choices[0].message.parsed
         except Exception as e:
-            return {
-                "status": "INSUFFICIENT",
-                "explanation": f"Evaluation error: {str(e)}"
-            }
+            # Fallback manual completion parsing
+            try:
+                raw_response = self.llm_client.get_completion(messages, temperature=0.0)
+                cleaned_response = raw_response
+                if cleaned_response.startswith("```"):
+                    lines = cleaned_response.splitlines()
+                    if len(lines) > 2:
+                        cleaned_response = "\n".join(lines[1:-1])
+                import json
+                parsed = json.loads(cleaned_response)
+                # Map old keys if LLM returned them
+                useful_val = parsed.get("useful", parsed.get("status") == "SUFFICIENT")
+                desc_val = parsed.get("description", parsed.get("explanation", "Could not parse evaluation."))
+                return EvaluationReport(useful=useful_val, description=desc_val)
+            except Exception as ex:
+                return EvaluationReport(
+                    useful=False,
+                    description=f"Evaluation error: {str(e)} -> {str(ex)}"
+                )
 
     def game_web_search(self, query: str) -> dict:
         """
         Tool 3: Performs a web search using the Tavily API to find real-time or missing
-        information about video games. If the API key is not present, falls back to a high-fidelity
-        mock search database for standard project queries.
+        information about video games.
         """
         if not self.tavily_client:
-            # Fall back to high-fidelity mock web search results for project queries
-            query_lower = query.lower()
-            if "rockstar" in query_lower:
-                return {
-                    "query": query,
-                    "results": [
-                        {
-                            "title": "Rockstar Games Current Projects - Grand Theft Auto VI",
-                            "url": "https://www.rockstargames.com/gta-vi",
-                            "content": "Rockstar Games is currently developing Grand Theft Auto VI (GTA 6). The game is highly anticipated and is expected to release in late 2025 for PlayStation 5 and Xbox Series X/S. It is set in the fictional state of Leonida (based on Florida) and features dual protagonists Lucia and Jason."
-                        },
-                        {
-                            "title": "GTA 6 Release Window and Latest News",
-                            "url": "https://www.ign.com/articles/gta-6-rockstar-games-development",
-                            "content": "Take-Two Interactive confirmed that Grand Theft Auto VI is on track for a Fall 2025 release window. Development is in full swing, and Rockstar is prioritizing the next major installment of the GTA franchise."
-                        }
-                    ]
-                }
-            elif "god of war" in query_lower or "ragnarok" in query_lower:
-                return {
-                    "query": query,
-                    "results": [
-                        {
-                            "title": "God of War Ragnarök Release Date and Platforms",
-                            "url": "https://www.playstation.com/en-us/games/god-of-war-ragnarok/",
-                            "content": "God of War Ragnarök was developed by Santa Monica Studio and published by Sony Interactive Entertainment. It was released worldwide on November 9, 2022, for the PlayStation 4 and PlayStation 5."
-                        }
-                    ]
-                }
-            elif "fifa 21" in query_lower:
-                return {
-                    "query": query,
-                    "results": [
-                        {
-                            "title": "FIFA 21 Developer and Info",
-                            "url": "https://www.ea.com/games/fifa/fifa-21",
-                            "content": "FIFA 21 is a football simulation video game published by Electronic Arts. It was developed by EA Vancouver and EA Romania and released on October 9, 2020."
-                        }
-                    ]
-                }
-            elif "pok" in query_lower and "red" in query_lower:
-                return {
-                    "query": query,
-                    "results": [
-                        {
-                            "title": "Pokémon Red and Blue Release and Platforms",
-                            "url": "https://www.pokemon.com/us/pokemon-video-games/pokemon-red-version/",
-                            "content": "Pokémon Red Version and Blue Version are role-playing video games developed by Game Freak and published by Nintendo for the Game Boy. They were first released in Japan in 1996."
-                        }
-                    ]
-                }
-            else:
-                return {
-                    "query": query,
-                    "results": [
-                        {
-                            "title": "Gaming Industry Search Results",
-                            "url": "https://en.wikipedia.org/wiki/Video_game_industry",
-                            "content": f"Information regarding video game query: {query}. The industry includes developers, publishers, and platforms."
-                        }
-                    ]
-                }
+            return {"query": query, "results": [], "error": "Tavily API client is not configured."}
 
         # Real Tavily Search
         try:
